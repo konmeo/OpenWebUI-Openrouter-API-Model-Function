@@ -1,14 +1,22 @@
 """
 title: OpenRouter Integration for OpenWebUI
-version: 0.4.5
+version: 0.4.6
 description: Integration with OpenRouter for OpenWebUI with Free Model Filtering and optional field improvements
 author: kevarch
 author_url: https://github.com/kevarch
-contributors: Eloi Marques da Silva (https://github.com/eloimarquessilva), Scythe Eden https://github.com/DarkEden-coding
+contributors:
+    Eloi Marques da Silva (https://github.com/eloimarquessilva),
+    Scythe Eden (https://github.com/DarkEden-coding),
+    Kevin Pham (https://github.com/konmeo)
 credits: rburmorrison (https://github.com/rburmorrison), Google Gemini Pro 2.5, Claude 4 Sonnet
 license: MIT
 
 Changelog:
+- Version 0.4.6:
+  * Contribution by Kevin Pham
+  * Changed FREE_ONLY with MAX_INPUT_PRICE parameter to optionally filter and set set model price cap
+  * Changed SHOW_USAGE_STATS to display extended usage statistics in info tooltip instead of at the end of responses
+  * Added SHOW_MODEL_DESCRIPTION parameter to display model description and statistics
 - Version 0.4.5:
   * Contribution by Scythe Eden
   * Added _sanitize_messages_for_notifications function to remove notification lines from messages before sending to the model.
@@ -43,6 +51,7 @@ import json
 import traceback  # Import traceback for detailed error logging
 from typing import Optional, List, Union, Generator, Iterator
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 
 # --- Helper function for citation text insertion ---
@@ -104,7 +113,7 @@ def _format_citation_list(citations: list[str]) -> str:
 
 
 # --- Helper function for pricing formatting ---
-def _format_pricing(model_data: dict) -> str:
+def _format_pricing(model_data: dict) -> tuple:
     """
     Format pricing information from model data.
 
@@ -112,7 +121,7 @@ def _format_pricing(model_data: dict) -> str:
         model_data: Model data from OpenRouter API
 
     Returns:
-        Formatted pricing string like "($0.15, $0.60) $0.75" or empty string if no pricing
+        Formatted pricing like: $0.15, $0.60, $0.75
     """
     try:
         pricing = model_data.get("pricing", {})
@@ -126,11 +135,11 @@ def _format_pricing(model_data: dict) -> str:
             return ""
 
         # Convert from per-token to per-1M tokens for readability
-        prompt_per_1m = float(prompt_price) * 1_000_000
-        completion_per_1m = float(completion_price) * 1_000_000
+        prompt_per_1m = max(-1, float(prompt_price) * 1_000_000)
+        completion_per_1m = max(-1, float(completion_price) * 1_000_000)
         total_per_1m = prompt_per_1m + completion_per_1m
 
-        return f" (${prompt_per_1m:.2f}, ${completion_per_1m:.2f}) ${total_per_1m:.2f}"
+        return f"${prompt_per_1m:.2f}", f"${completion_per_1m:.2f}", f"${total_per_1m:.2f}"
 
     except (ValueError, TypeError, AttributeError) as e:
         print(
@@ -211,41 +220,6 @@ def _process_effort_from_message(
         return first_word, effort_notification
 
     return default_effort, ""
-
-
-# --- Helper function for usage statistics formatting ---
-def _format_usage_stats(usage_data: dict) -> str:
-    """
-    Format usage statistics from OpenRouter API response.
-
-    Args:
-        usage_data: Usage data from API response
-
-    Returns:
-        Formatted usage statistics string
-    """
-    if not usage_data:
-        return ""
-
-    try:
-        prompt_tokens = usage_data.get("prompt_tokens", 0)
-        completion_tokens = usage_data.get("completion_tokens", 0)
-        
-        # Extract reasoning tokens from completion_tokens_details
-        completion_details = usage_data.get("completion_tokens_details", {})
-        reasoning_tokens = completion_details.get("reasoning_tokens", 0)
-        
-        # Calculate actual output tokens (completion - reasoning)
-        output_tokens = completion_tokens - reasoning_tokens
-        
-        # Cost is in credits, convert to dollars (1000 credits = $1)
-        cost = usage_data.get("cost", 0)
-
-        return f"\n\n---\n**Usage:** {prompt_tokens}, {reasoning_tokens}, {output_tokens}, ${cost:.4f}"
-
-    except (TypeError, ValueError, KeyError) as e:
-        print(f"Error formatting usage statistics: {e}")
-        return ""
 
 
 # --- Helper function to remove notification lines from messages ---
@@ -343,9 +317,9 @@ class Pipe:
             default=False,
             description="Enable OpenRouter prompt caching by adding 'cache_control' to potentially large message parts. May reduce costs for supported models (e.g., Anthropic, Gemini) on subsequent calls with the same cached prefix. See OpenRouter docs for details.",
         )
-        FREE_ONLY: bool = Field(
-            default=False,
-            description="If true, only free models will be available.",
+        MAX_INPUT_PRICE: Optional[float] = Field(
+            default=None,
+            description="Only show models that cost at most this amount per million input tokens.  Set to 0 for free models only.",
         )
         SHOW_PRICING: bool = Field(
             default=True,
@@ -353,7 +327,11 @@ class Pipe:
         )
         SHOW_USAGE_STATS: bool = Field(
             default=False,
-            description="If true, show usage statistics (input, reasoning, output tokens and cost) at the end of each response.",
+            description="If true, show extended usage statistics (input, reasoning, output tokens and cost) in info tooltip.",
+        )
+        SHOW_MODEL_DESCRIPTION: bool = Field(
+            default=False,
+            description="If true, show model statistics (creation date, context size, and pricings) in model description.",
         )
 
     def __init__(self):
@@ -427,20 +405,41 @@ class Pipe:
                         if not keep:
                             continue
 
-                # Apply Free Only Filtering
-                if self.valves.FREE_ONLY and "free" not in model_id.lower():
+                # Apply Pricing Filtering
+                if (
+                    self.valves.MAX_INPUT_PRICE is not None
+                    and float(model.get("pricing", {}).get("prompt", 0)) * 1000000
+                    > self.valves.MAX_INPUT_PRICE
+                ):
                     continue
 
                 model_name = model.get("name", model_id)
                 prefix = self.valves.MODEL_PREFIX or ""
 
+                description = None
+
+                prompt_price, completion_price, total_price = _format_pricing(model)
+
                 # Add pricing information if enabled
                 pricing_info = ""
                 if self.valves.SHOW_PRICING:
-                    pricing_info = _format_pricing(model)
+                    pricing_info = f" ({prompt_price}, {completion_price}) {total_price}"
+
+                if self.valves.SHOW_MODEL_DESCRIPTION:
+                    description = (
+                        f'({datetime.fromtimestamp(model.get("created")).strftime("%m/%Y")}: '
+                        + f'{int(model.get("context_length", 0)) / 1000:,.0f}K '
+                        + f'${prompt_price} / ${completion_price})\n\n'
+                        + model.get("description", "")
+                    )
 
                 formatted_name = f"{prefix}{model_name}{pricing_info}"
-                models.append({"id": model_id, "name": formatted_name})
+
+                models.append({
+                    "id": model_id,
+                    "name": formatted_name,
+                    "description": description
+                })
 
             if not models:
                 if self.valves.FREE_ONLY:
@@ -666,7 +665,7 @@ class Pipe:
                     self.valves.REQUEST_TIMEOUT,
                 )
             else:
-                return self.non_stream_response(
+                content, usage = self.non_stream_response(
                     url,
                     headers,
                     payload,
@@ -674,6 +673,7 @@ class Pipe:
                     _format_citation_list,
                     self.valves.REQUEST_TIMEOUT,
                 )
+                return {"content": content, "usage": usage}
 
         except Exception as e:
             print(f"Error preparing request in pipe method: {e}")
@@ -705,7 +705,6 @@ class Pipe:
             content = citation_inserter(content, citations)
             reasoning = citation_inserter(reasoning, citations)
             citation_list = citation_formatter(citations)
-            usage_stats = _format_usage_stats(usage) if self.valves.SHOW_USAGE_STATS else ""
 
             final = ""
 
@@ -725,8 +724,7 @@ class Pipe:
                 final += content
             if final:
                 final += citation_list
-                final += usage_stats
-            return final
+            return final, usage
 
         except requests.exceptions.Timeout:
             return f"Pipe Error: Request timed out ({timeout}s)"
@@ -819,11 +817,10 @@ class Pipe:
             
             # Append citations list
             yield citation_formatter(latest_citations)
-            
-            # Add usage statistics if enabled
-            if self.valves.SHOW_USAGE_STATS and latest_usage:
-                print(f"Usage stats: {latest_usage}")
-                yield _format_usage_stats(latest_usage)
+
+            # Yield final usage data if available
+            if latest_usage:
+                yield f"data: {json.dumps({'usage': latest_usage})}\n\n"
 
         except GeneratorExit:
             if response:
